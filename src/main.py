@@ -41,11 +41,11 @@ agent = initialize_agent(
 )
 
 # 여행지 추천 함수 정의
-def recommend_travel_places(age, gender, location):
-    query = f"{location}에서 {age}세 {gender}이 여행하기 좋은 장소를 추천해주세요."
+def recommend_travel_places(age, gender, location, days):
+    query = f"{location}에서 {age}세 {gender}이 {days}일 동안 여행하기 좋은 코스를 추천해주세요."
     response = agent.run(query)
 
-    print("\n🚩 추천 여행지 🚩")
+    print("\n🚩 추천 국내 여행 코스 🚩")
     print(response)
 
 # 실행 예시
@@ -54,5 +54,6 @@ if __name__ == "__main__":
     age = 28
     gender = "여성"
     location = "서울"
+    days = 3
 
-    recommend_travel_places(age, gender, location)
+    recommend_travel_places(age, gender, location, days)
