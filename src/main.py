@@ -2,7 +2,8 @@
 from dotenv import load_dotenv
 import os
 from langchain_openai import ChatOpenAI
-from langchain.agents import initialize_agent, Tool, AgentType
+from langchain.agents import create_react_agent, AgentExecutor, Tool
+from langchain.prompts import ChatPromptTemplate
 from googleapiclient.discovery import build
 
 # API KEY 정보로드
@@ -32,21 +33,55 @@ google_tool = Tool(
     description="여행지 구글 검색"
 )
 
-# Agent 초기화
-agent = initialize_agent(
-    [google_tool],
-    llm,
-    agent=AgentType.OPENAI_FUNCTIONS,
-    verbose = True #운영시 False
-)
+# 사용자 입력 기반 템플릿 작성
+custom_prompt = ChatPromptTemplate.from_template("""
+당신은 힐링 여행지를 추천하는 도우미입니다.
+사용자의 연령, 성별, 여행 지역, 여행 일수, 여행 타입 정보를 바탕으로 국내 여행 코스를 추천하세요.
+
+사용자 입력: {input}
+
+아래는 사용자 정보입니다:
+- 나이: {age}
+- 성별: {gender}
+- 여행 지역: {location}
+- 여행 기간: {days}일
+- 여행 타입: {travel_type} (예: 조용한 자연, 도심 감성, 밤문화, 역사 탐방 등)
+
+도구 이름 리스트:
+{tool_names}
+                                                 
+사용 가능한 도구 목록:
+{tools}
+
+에이전트가 수행한 이전 작업들:
+{agent_scratchpad}
+
+각 여행지에 대해:
+1. 장소명과 간단한 설명
+2. 혼잡도 정보 (예상 기준)
+3. 추천 코스 (2~3시간 기준 루트)
+4. 관련 꿀팁
+
+결과는 보기 좋게 정리된 텍스트 형식으로 출력해주세요.
+""")
+
+# REACT 에이전트 생성
+react_agent = create_react_agent(llm=llm, tools=[google_tool], prompt=custom_prompt)
+agent_executor = AgentExecutor(agent=react_agent, tools=[google_tool], verbose=True)
 
 # 여행지 추천 함수 정의
-def recommend_travel_places(age, gender, location, days):
-    query = f"{location}에서 {age}세 {gender}이 {days}일 동안 여행하기 좋은 코스를 추천해주세요."
-    response = agent.run(query)
+def recommend_travel_places(age, gender, location, days, travel_type):
+    user_input = f"""
+    나이: {age}
+    성별: {gender}
+    여행 지역: {location}
+    여행 기간: {days}일
+    여행 타입: {travel_type}
+    """
+    response = agent_executor.invoke({"input": user_input})
 
     print("\n🚩 추천 국내 여행 코스 🚩")
-    print(response)
+    print(response["output"])
 
 # 실행 예시
 if __name__ == "__main__":
@@ -56,4 +91,7 @@ if __name__ == "__main__":
     location = "서울"
     days = 3
 
-    recommend_travel_places(age, gender, location, days)
+    # 여행 타입 지정
+    travel_type = "조용한 자연"
+
+    recommend_travel_places(age, gender, location, days, travel_type)
