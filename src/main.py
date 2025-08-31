@@ -26,6 +26,23 @@ BASE_URL_HTTP  = "http://apis.data.go.kr/B551011/KorService2"
 llm = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY)
 
 # ---------------------------------------------------------------------
+# 로깅/스위치
+# ---------------------------------------------------------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()  # DEBUG/INFO/WARN/ERROR
+
+def _log(level: str, msg: str):
+    order = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40}
+    if order[level] >= order.get(LOG_LEVEL, 20):
+        print(f"[{level}] {msg}")
+
+# SSL/폴백 상태
+SSL_WARNED = False                 # HTTPS→HTTP 경고는 최초 1회만
+FORCE_HTTP = False                 # True면 이후 요청 전부 HTTP로만
+SSL_ERRORS = 0                     # SSL 오류 누적
+SSL_ERROR_THRESHOLD = int(os.getenv("SSL_ERROR_THRESHOLD", "2"))  # N회 초과 시 Google-only
+GOOGLE_ONLY_SESSION = False        # 세션 전역 Google-only 전환 스위치
+
+# ---------------------------------------------------------------------
 # 서비스키 및 세션 설정
 # ---------------------------------------------------------------------
 def _normalize_service_key(raw: str) -> str:
@@ -40,7 +57,7 @@ SERVICE_KEY = _normalize_service_key(TOURAPI_KEY)
 
 def _mk_session() -> requests.Session:
     s = requests.Session()
-    retries = Retry(total=3, backoff_factor=0.5,
+    retries = Retry(total=3, backoff_factor=0.4,
                     status_forcelist=[429, 500, 502, 503, 504],
                     allowed_methods=["GET"])
     s.mount("https://", HTTPAdapter(max_retries=retries))
@@ -54,20 +71,41 @@ def tourapi_params(**kwargs):
     base.update({k: v for k, v in kwargs.items() if v not in [None, "", [], {}]})
     return base
 
-def _request_with_fallback(path: str, params: dict, timeout: int = 30):
-    try:
-        print(f"[LOG] HTTPS 요청: {path} params={params}")
-        return SESSION.get(f"{BASE_URL_HTTPS}/{path}", params=params, timeout=timeout)
-    except requests.exceptions.SSLError:
-        print(f"[WARN] HTTPS 실패 → HTTP 폴백: {path}")
-        return SESSION.get(f"{BASE_URL_HTTP}/{path}", params=params, timeout=timeout)
+# ---------------------------------------------------------------------
+# HTTP 요청 (HTTPS 1회 경고, 임계치 초과 시 Google-only 전환)
+# ---------------------------------------------------------------------
+
+def _request_with_fallback(path: str, params: dict, timeout: int = 20):
+    global SSL_WARNED, FORCE_HTTP, SSL_ERRORS, GOOGLE_ONLY_SESSION
+
+    if SSL_ERRORS >= SSL_ERROR_THRESHOLD:
+        GOOGLE_ONLY_SESSION = True
+        _log("WARN", "SSL 오류 임계 초과 → 세션 Google-only 전환")
+
+    try_https = not FORCE_HTTP
+    if try_https:
+        try:
+            _log("DEBUG", f"HTTPS 요청: {path} params={params}")
+            return SESSION.get(f"{BASE_URL_HTTPS}/{path}", params=params, timeout=timeout)
+        except requests.exceptions.SSLError:
+            SSL_ERRORS += 1
+            if not SSL_WARNED:
+                _log("WARN", f"HTTPS 실패 → HTTP 폴백 (누적 SSL 오류 {SSL_ERRORS})")
+                SSL_WARNED = True
+            FORCE_HTTP = True  # 이후엔 계속 HTTP 사용
+
+    _log("DEBUG", f"HTTP 요청: {path} params={params}")
+    return SESSION.get(f"{BASE_URL_HTTP}/{path}", params=params, timeout=timeout)
+
 
 def tour_get(path: str, **params):
+    if GOOGLE_ONLY_SESSION:
+        raise RuntimeError("GOOGLE_ONLY_SESSION")
     r = _request_with_fallback(path, tourapi_params(**params))
     r.raise_for_status()
     js = r.json()
     items = js.get("response", {}).get("body", {}).get("items", {}).get("item", []) or []
-    print(f"[LOG] {path} 결과 건수={len(items)}")
+    _log("INFO", f"{path} 결과 건수={len(items)}")
     return items
 
 # ---------------------------------------------------------------------
@@ -167,80 +205,84 @@ def robust_json(s: str, fallback: dict) -> dict:
     except Exception:
         return fallback
 
-# -----------------------------
+# ---------------------------------------------------------------------
 # 유틸: 이미지 보강
-# -----------------------------
+# ---------------------------------------------------------------------
+
 def fetch_image_for(title: str) -> str:
     try:
         imgs = google_image.invoke({"query": f"{title} 사진"})
         return imgs[0] if imgs else ""
     except Exception as e:
-        print(f"[WARN] 이미지 검색 실패: {title}, {e}")
+        _log("WARN", f"이미지 검색 실패: {title}, {e}")
         return ""
+
 
 def attach_images_if_missing(items: List[Dict[str, Any]]):
     for it in items:
         img = it.get("firstimage") or it.get("firstimage2") or it.get("image")
-        if not img:
-            img = fetch_image_for(it.get("title", ""))
-            if img:
-                it["image"] = img
+        if not img and it.get("title"):
+            it["image"] = fetch_image_for(it.get("title"))
 
-# -----------------------------
-# 지역명 → areaCode/sigunguCode/좌표 변환 (안전)
-# -----------------------------
+# ---------------------------------------------------------------------
+# 지역명 → areaCode/sigunguCode/좌표 변환 (첫 히트 즉시 종료, 실패 시 origin 유지)
+# ---------------------------------------------------------------------
+
 def resolve_area_to_origin(area_name: str) -> Tuple[Optional[float], Optional[float], Optional[str], Optional[str]]:
-    """
-    지역명 → (mapx, mapy, areaCode, sigunguCode)
-    - 시군구 이름(부천/마포 등) 우선 정밀 매칭
-    - 매칭 실패 시 (None, None, None, None) 반환 (절대 임의 좌표로 대체하지 않음)
-    """
     if not area_name:
         return None, None, None, None
 
-    print(f"[LOG] 지역명 '{area_name}' → 행정코드 탐색")
-    areas = tour_area_code.invoke({"areaCode": None, "numOfRows": 100})
+    _log("INFO", f"지역명 '{area_name}' → 행정코드 탐색")
+    try:
+        areas = tour_area_code.invoke({"areaCode": None, "numOfRows": 100})
+    except Exception as e:
+        _log("WARN", f"areaCode2 호출 실패: {e}")
+        return None, None, None, None
+
     norm = area_name.replace("시", "").replace("군", "").replace("구", "").replace(" ", "")
 
-    # 모든 시/도에 대해 시군구 전체를 훑어서 정밀 탐색
     for a in areas:
         ac = str(a.get("code"))
-        sggs = tour_area_code.invoke({"areaCode": ac, "numOfRows": 500})
+        try:
+            sggs = tour_area_code.invoke({"areaCode": ac, "numOfRows": 300})
+        except Exception as e:
+            _log("WARN", f"areaCode2 시군구 조회 실패(ac={ac}): {e}")
+            continue
+
         for s in sggs:
             sname = (s.get("name") or "").replace("시","" ).replace("군","" ).replace("구","" ).replace(" ", "")
             if not sname:
                 continue
             if sname == norm or norm in sname or sname in norm:
-                sigungu_code = str(s.get("code"))
-                # 대표 POI 1개로 좌표 추정 (실 지오코딩 대체)
-                pois = tour_area_based.invoke({"areaCode": ac, "sigunguCode": sigungu_code, "contentTypeId": 12, "numOfRows": 1})
-                if pois:
-                    try:
-                        return float(pois[0]["mapx"]), float(pois[0]["mapy"]), ac, sigungu_code
-                    except Exception:
-                        pass
-                return None, None, ac, sigungu_code
+                sc = str(s.get("code"))
+                # 좌표 추정 1회만 수행
+                try:
+                    pois = tour_area_based.invoke({"areaCode": ac, "sigunguCode": sc, "contentTypeId": 12, "numOfRows": 1})
+                    if pois:
+                        return float(pois[0]["mapx"]), float(pois[0]["mapy"]), ac, sc
+                except Exception as e:
+                    _log("WARN", f"좌표 추정 실패(ac={ac},sc={sc}): {e}")
+                return None, None, ac, sc
 
-    print("[WARN] 행정코드 매핑 실패 → origin 변경하지 않음")
+    _log("WARN", "행정코드 매핑 실패")
     return None, None, None, None
 
-# -----------------------------
+# ---------------------------------------------------------------------
 # 노드들
-# -----------------------------
+# ---------------------------------------------------------------------
+
 def node_parse_query(state: TripState):
-    print(f"[LOG] node_parse_query 입력: {state['userQuery']}")
-    prompt = SYSTEM_PARSE_PROMPT.format(query=state["userQuery"])
-    out = llm.invoke(prompt)
+    _log("INFO", f"node_parse_query: {state['userQuery']}")
+    out = llm.invoke(SYSTEM_PARSE_PROMPT.format(query=state["userQuery"]))
     text = getattr(out, "content", out)
     parsed = robust_json(text, {"days": state.get("days", 1), "mode": state.get("mode", "walk"), "tags": [], "area": None})
 
-    # '내 주변/근처' 표현이 있으면 지역 해석을 생략하고 origin 유지
+    # '내 주변/근처'이면 지역 해석 생략하고 origin 유지
     q = state["userQuery"]
     if any(tok in q for tok in ["내 주변", "내주변", "근처", "가까운", "주변"]):
         parsed["area"] = None
-        print("[LOG] '내 주변/근처' 감지 → area 해석 생략, origin 유지")
+        _log("INFO", "'내 주변/근처' 감지 → area 해석 생략, origin 유지")
 
-    print(f"[LOG] node_parse_query 결과: {parsed}")
     days = int(parsed.get("days", state.get("days", 1)) or 1)
     mode = parsed.get("mode", state.get("mode", "walk")) or "walk"
     tags = parsed.get("tags", [])
@@ -251,8 +293,8 @@ def node_parse_query(state: TripState):
 def node_resolve_area(state: TripState):
     area_name = state.get("area")
     if not area_name:
-        print("[LOG] 지역명 없음 또는 '내 주변' → 기존 origin 사용")
-        state["areaResolved"] = True  # 주변 기준 사용을 성공으로 간주
+        _log("INFO", "지역명 없음 → 기존 origin 사용")
+        state["areaResolved"] = True
         return state
 
     mx, my, ac, sc = resolve_area_to_origin(area_name)
@@ -260,24 +302,27 @@ def node_resolve_area(state: TripState):
         state["areaCode"], state["sigunguCode"] = ac, sc
         if mx is not None and my is not None:
             state["origin"] = {"mapX": mx, "mapY": my}
-            print(f"[LOG] 지역 좌표 반영: ({mx}, {my}), areaCode={ac}, sigunguCode={sc}")
+            _log("INFO", f"지역 좌표 반영: ({mx},{my}), areaCode={ac}, sigunguCode={sc}")
         else:
-            print(f"[LOG] 코드만 매칭됨(areaCode={ac}, sigunguCode={sc}) → origin은 유지")
+            _log("INFO", f"코드만 매칭됨(areaCode={ac}, sigunguCode={sc}) → origin 유지")
         state["areaResolved"] = True
         return state
 
-    print("[LOG] 지역 매핑 실패 → origin 유지 + 구글 보강 모드로 전환")
+    _log("WARN", "지역 매핑 실패 → origin 유지 + Google-only")
     state["areaResolved"] = False
     return state
 
+# 카테고리 최소 요구치 (부족 시 부분 Google 보강)
+MIN_POI = 6
+MIN_MEAL = 4
+MIN_STAY = 3
 
 def _build_google_only_candidates(state: TripState) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """매핑 실패 시: 전부 Google 검색으로 후보 생성 (POI/MEAL, STAY). 좌표는 미제공(None)."""
     theme = " ".join(state.get("tags", [])) or "여행"
     area_kw = state.get("area") or "내 주변"
 
-    poi_res = google_enrich.invoke({"query": f"{area_kw} {theme} 명소 추천"})
-    eat_res = google_enrich.invoke({"query": f"{area_kw} 맛집 추천"})
+    poi_res  = google_enrich.invoke({"query": f"{area_kw} {theme} 명소 추천"})
+    eat_res  = google_enrich.invoke({"query": f"{area_kw} 맛집 추천"})
     stay_res = google_enrich.invoke({"query": f"{area_kw} 호텔 숙소 추천"})
 
     def to_item(r: Dict[str, str], seg_type: str) -> Dict[str, Any]:
@@ -286,7 +331,7 @@ def _build_google_only_candidates(state: TripState) -> Tuple[List[Dict[str, Any]
             "type": seg_type,
             "title": r.get("title"),
             "desc": r.get("snippet"),
-            "reason": f"TourAPI 매핑 실패로 Google 검색 결과를 기반으로 추천했습니다.",
+            "reason": "Google 검색 결과를 기반으로 추천",
             "image": img,
             "coords": None,
             "source": r.get("link")
@@ -301,53 +346,59 @@ def _build_google_only_candidates(state: TripState) -> Tuple[List[Dict[str, Any]
             "image": fetch_image_for(r.get("title", "")),
             "coords": None,
             "source": r.get("link")
-        }
-        for r in stay_res[:5]
+        } for r in stay_res[:5]
     ]
     return pois_meals, stays
 
 
 def node_fetch_pois(state: TripState):
-    # 매핑 실패 시: TourAPI를 전혀 사용하지 않고 Google+LLM만 사용
-    if state.get("areaResolved") is False:
-        print("[LOG] areaResolved=False → Google-only 후보 생성")
+    # 지역 매핑 실패 또는 세션 전환 시: 즉시 Google-only
+    if state.get("areaResolved") is False or GOOGLE_ONLY_SESSION:
+        _log("INFO", "Google-only 후보 생성 (매핑 실패 또는 세션 전환)")
         pois, stays = _build_google_only_candidates(state)
-        print(f"[LOG] Google-only 후보: POI/MEAL {len(pois)}개, STAY {len(stays)}개")
+        attach_images_if_missing(pois); attach_images_if_missing(stays)
+        _log("INFO", f"Google-only 후보: POI/MEAL {len(pois)}개, STAY {len(stays)}개")
         return {**state, "pois": pois, "stays": stays}
 
-    print(f"[LOG] node_fetch_pois 실행, origin=({state['origin']['mapX']}, {state['origin']['mapY']})")
+    _log("INFO", f"node_fetch_pois origin=({state['origin']['mapX']}, {state['origin']['mapY']})")
     x, y = state["origin"]["mapX"], state["origin"]["mapY"]
 
-    spots = tour_location_based.invoke({"mapX": x, "mapY": y, "radius": 7000, "contentTypeId": 12, "arrange": "E", "numOfRows": 20})
-    eats  = tour_location_based.invoke({"mapX": x, "mapY": y, "radius": 7000, "contentTypeId": 39, "arrange": "E", "numOfRows": 20})
-    stays = tour_location_based.invoke({"mapX": x, "mapY": y, "radius": 7000, "contentTypeId": 32, "arrange": "E", "numOfRows": 10})
+    try:
+        spots = tour_location_based.invoke({"mapX": x, "mapY": y, "radius": 7000, "contentTypeId": 12, "arrange": "E", "numOfRows": 20})
+        eats  = tour_location_based.invoke({"mapX": x, "mapY": y, "radius": 7000, "contentTypeId": 39, "arrange": "E", "numOfRows": 20})
+        stays = tour_location_based.invoke({"mapX": x, "mapY": y, "radius": 7000, "contentTypeId": 32, "arrange": "E", "numOfRows": 10})
+    except Exception as e:
+        _log("WARN", f"TourAPI 호출 실패 → Google-only: {e}")
+        pois, stays = _build_google_only_candidates(state)
+        attach_images_if_missing(pois); attach_images_if_missing(stays)
+        return {**state, "pois": pois, "stays": stays}
 
-    # 이미지 보강
-    attach_images_if_missing(spots)
-    attach_images_if_missing(eats)
-    attach_images_if_missing(stays)
+    attach_images_if_missing(spots); attach_images_if_missing(eats); attach_images_if_missing(stays)
+
+    # 카테고리별 부족 시 부분 Google 보강
+    if len(spots) < MIN_POI or len(eats) < MIN_MEAL or len(stays) < MIN_STAY:
+        _log("INFO", "카테고리별 부족 → 부분 Google 보강")
+        g_pois, g_stays = _build_google_only_candidates(state)
+        g_spots = [x for x in g_pois if x.get("type") == "POI"]
+        g_eats  = [x for x in g_pois if x.get("type") == "MEAL"]
+        if len(spots) < MIN_POI:
+            spots += g_spots[: (MIN_POI - len(spots))]
+        if len(eats) < MIN_MEAL:
+            eats  += g_eats[: (MIN_MEAL - len(eats))]
+        if len(stays) < MIN_STAY:
+            stays += g_stays[: (MIN_STAY - len(stays))]
 
     pois = spots + eats
-
-    if not pois:
-        # TourAPI에 데이터가 없을 때도 Google-only로 보강
-        print(f"[LOG] TourAPI 결과 없음 → Google-only 후보 생성")
-        pois, stays_google = _build_google_only_candidates(state)
-        # stays는 둘 중 더 풍부한 쪽 사용
-        if not stays:
-            stays = stays_google
-
-    print(f"[LOG] node_fetch_pois 결과: 관광지+음식점 {len(pois)}개, 숙박 {len(stays)}개")
+    _log("INFO", f"최종 후보: 관광지+음식점 {len(pois)}개, 숙박 {len(stays)}개")
     return {**state, "pois": pois, "stays": stays}
 
 
 def node_build_itinerary(state: TripState):
-    print(f"[LOG] node_build_itinerary 실행, days={state.get('days')}, tags={state.get('tags')}, pois={len(state.get('pois', []))}, stays={len(state.get('stays', []))}")
+    _log("INFO", f"node_build_itinerary: days={state.get('days')}, tags={state.get('tags')}, pois={len(state.get('pois', []))}, stays={len(state.get('stays', []))}")
     if not state.get("pois"):
         return {**state, "plan": {"days": []}}
 
-    # LLM에게 일정 설계 위임 (태그까지 반영)
-    pois_text = json.dumps(state["pois"][:50], ensure_ascii=False)
+    pois_text  = json.dumps(state["pois"][:50], ensure_ascii=False)
     stays_text = json.dumps(state["stays"][:8], ensure_ascii=False)
 
     prompt = f"""
@@ -373,7 +424,6 @@ def node_build_itinerary(state: TripState):
     out = llm.invoke(prompt)
     plan = robust_json(getattr(out, "content", out), {"keywords": [], "days": [], "stays": [], "summary": ""})
 
-    # LLM이 stays를 비웠다면, TourAPI/Google 후보로 보완
     if not plan.get("stays") and state.get("stays"):
         simple_stays = []
         for s in state["stays"][:5]:
@@ -388,7 +438,10 @@ def node_build_itinerary(state: TripState):
 
     return {**state, "plan": plan}
 
+# ---------------------------------------------------------------------
 # 그래프 구성
+# ---------------------------------------------------------------------
+
 graph = StateGraph(TripState)
 graph.add_node("ParseQuery", node_parse_query)
 graph.add_node("ResolveArea", node_resolve_area)
@@ -406,7 +459,7 @@ app = graph.compile()
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
     init: TripState = {
-        "userQuery": "부천에서 힐링 테마로 2박 3일 여행코스 추천해줘",
+        "userQuery": "마포에서 신나게 노는 테마로 3박 4일 여행코스 추천해줘",
         "origin": {"mapX": 126.98375, "mapY": 37.563446},  # 초기값(명동) — 지역 해석 실패 시 그대로 유지
         "days": 3,
         "mode": "walk",
