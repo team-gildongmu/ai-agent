@@ -1,8 +1,12 @@
 python-dotenv
 pydantic
 httpx
+requests
+urllib3
 
 langchain
 langchain-openai
+langchain-core
+langgraph
 openai
 google-api-python-client
