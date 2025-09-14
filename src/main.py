@@ -128,7 +128,7 @@ def robust_json(s: str, fallback: dict) -> dict:
         return fallback
 
 # ---------------------------------------------------------------------
-# Google Places v1 + OSM(Nominatim) 지오코딩 / 검색 (★ 전면 교체)
+# Google Places v1 + OSM(Nominatim) 지오코딩 / 검색
 # ---------------------------------------------------------------------
 AGGRO_TITLE_PATTERNS = ["리스트", "베스트", "BEST", "Top", "TOP", "추천", "근처", "예약", "할인", "|", ":"]
 
@@ -146,12 +146,10 @@ def _places_v1_headers() -> Dict[str, str]:
     return {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
-        # 필요한 필드만 가져와서 응답 가볍게
         "X-Goog-FieldMask": "places.displayName,places.id,places.location,places.photos,places.types,places.rating,places.googleMapsUri"
     }
 
 def _places_v1_photo_url(photo_name: str, max_px=800) -> str:
-    # photo_name 예: "places/ChIJ..../photos/AbCdEf..."
     if not (_places_ready() and photo_name):
         return ""
     return f"https://places.googleapis.com/v1/{photo_name}/media?key={GOOGLE_PLACES_API_KEY}&maxWidthPx={max_px}"
@@ -165,10 +163,6 @@ def _places_v1_search_text(
     language: str = "ko",
     region: str = "KR",
 ) -> List[Dict[str, Any]]:
-    """
-    Places API(New) v1: places:searchText
-    included_type 예: "tourist_attraction", "restaurant", "lodging"
-    """
     if not _places_ready() or not text_query:
         return []
     url = "https://places.googleapis.com/v1/places:searchText"
@@ -213,7 +207,7 @@ def _places_v1_search_text(
                 "images": images,
                 "provider": "google",
                 "place_id": p.get("id"),
-                "source": p.get("googleMapsUri") or "",   # v1에서 제공
+                "source": p.get("googleMapsUri") or "",
                 "rating": p.get("rating"),
             })
         return out
@@ -222,13 +216,10 @@ def _places_v1_search_text(
         return []
 
 def _geocode_text(query: str, region: str = "KR") -> Optional[Dict[str, float]]:
-    """텍스트(홍대/연남동/랜드마크) → 좌표. v1 사용, 실패 시 Nominatim 폴백."""
-    # 1) Places v1
     res = _places_v1_search_text(query, included_type=None, origin=None, max_count=1, language="ko", region=region)
     if res:
         c = res[0]["coords"]
         return {"mapx": c["mapx"], "mapy": c["mapy"]}
-    # 2) Nominatim 폴백
     try:
         headers = {"User-Agent": "Gildongmu/1.0 (contact: dev@example.com)"}
         params = {"q": query, "format": "json", "limit": 1}
@@ -241,7 +232,6 @@ def _geocode_text(query: str, region: str = "KR") -> Optional[Dict[str, float]]:
     return None
 
 def google_places_search(area_kw: str, query: str, type_hint: Optional[str], origin: Optional[Dict[str,float]]) -> List[Dict[str, Any]]:
-    """Places v1 Text Search + locationBias(가능시). 장소(Place)만 반환."""
     q = f"{area_kw} {query}".strip()
     return _places_v1_search_text(q, included_type=type_hint, origin=origin, radius_m=7000.0, max_count=12, language="ko", region="KR")
 
@@ -293,7 +283,6 @@ def _valid(o: Dict[str, Any]) -> bool:
     return True
 
 def _norm_title(t: str) -> str:
-    """제목 정규화(소문자 + 한글/영문/숫자만 남기고 모두 제거) → 매칭률 향상."""
     t = (t or "").lower()
     return re.sub(r"[^a-z0-9가-힣]", "", t)
 
@@ -329,7 +318,6 @@ def node_parse_query(state: TripState):
     return {**state, "days": days, "mode": mode, "tags": tags, "area": area}
 
 def node_resolve_area(state: TripState):
-    """행정코드 삭제 → 지오코딩으로 origin 설정. 실패시 기존 origin 유지."""
     area_name = (state.get("area") or "").strip()
     if not area_name:
         if state.get("origin"):
@@ -380,7 +368,6 @@ def _build_google_only_candidates(state: TripState) -> (List[Dict[str, Any]], Li
     return _dedup_by_title(pois_meals), _dedup_by_title(stays)
 
 def node_fetch_pois(state: TripState):
-    """TourAPI 우선 → 부족시 Places 보강 → origin 없으면 Places-only."""
     if state.get("origin"):
         _set_status(state, "TOURAPI", "한국관광공사에서 여행지를 추천하고 있어요.")
         x, y = state["origin"]["mapX"], state["origin"]["mapY"]
@@ -401,11 +388,10 @@ def node_fetch_pois(state: TripState):
             _log("WARN", f"TourAPI 호출 실패 → Places-only 대체: {e}")
             _set_status(state, "GOOGLE", "여행에 도움이 될 만한 최신 자료를 확인하고 있어요.")
             pois, stays2 = _build_google_only_candidates(state)
-            pois = [p for p in pois if _valid(p)]
+            pois  = [p for p in pois  if _valid(p)]
             stays2 = [s for s in stays2 if _valid(s)]
             return {**state, "pois": pois, "stays": stays2}
 
-        # TourAPI 표준화
         attach_images_if_missing(spots); attach_images_if_missing(eats); attach_images_if_missing(stays)
         for it in spots + eats + stays:
             _std_provider_source(it)
@@ -413,7 +399,6 @@ def node_fetch_pois(state: TripState):
             it["coords"] = c if c else {"mapx": None, "mapy": None}
             it["images"] = it.get("images", [])[:3]
 
-        # 부족 시 Places 보강
         MIN_POI, MIN_MEAL, MIN_STAY = 6, 4, 3
         need_poi  = len(spots) < MIN_POI
         need_meal = len(eats)  < MIN_MEAL
@@ -430,7 +415,6 @@ def node_fetch_pois(state: TripState):
             if need_stay:
                 g_stays += gp_stays
 
-        # 합치기 + 유효성 필터 + 중복 제거
         pois = []
         for it in spots:
             pois.append({
@@ -465,7 +449,6 @@ def node_fetch_pois(state: TripState):
         _log("INFO", f"최종 후보: 관광지+음식점 {len(pois)}개, 숙박 {len(stays_std)}개")
         return {**state, "pois": pois, "stays": stays_std}
 
-    # origin 없음 → Places-only
     _set_status(state, "GOOGLE", "여행에 도움이 될 만한 최신 자료를 확인하고 있어요.")
     pois, stays = _build_google_only_candidates(state)
     pois  = _dedup_by_title([p for p in pois  if _valid(p)])
@@ -477,9 +460,12 @@ def node_build_itinerary(state: TripState):
     _set_status(state, "PLAN", "조금만 기다려주세요, 여행 계획을 완성하고 있어요!")
     _log("INFO", f"node_build_itinerary: days={state.get('days')}, tags={state.get('tags')}, pois={len(state.get('pois', []))}, stays={len(state.get('stays', []))}")
     if not state.get("pois"):
-        # ★ 완료 상태로 마무리
+        # 테마 주입 (POI 없어도)
+        themes_from_tags = list(dict.fromkeys(state.get("tags", [])))
+        empty_plan = {"title":"", "subtitle":"", "keywords": [], "days": [], "stays": [], "summary": "",
+                      "themes": themes_from_tags, "theme": (themes_from_tags[0] if themes_from_tags else None)}
         state["status"] = {"step": "DONE", "message": "완료되었습니다."}
-        return {**state, "plan": {"title":"", "subtitle":"", "days": []}}
+        return {**state, "plan": empty_plan}
 
     pois_text  = json.dumps(state["pois"][:50], ensure_ascii=False)
     stays_text = json.dumps(state["stays"][:8],  ensure_ascii=False)
@@ -507,7 +493,7 @@ def node_build_itinerary(state: TripState):
     plan = robust_json(getattr(out, "content", out),
                        {"title":"", "subtitle":"", "keywords": [], "days": [], "stays": [], "summary": ""})
 
-    # ----- ★ 카탈로그 인덱스 기반 ‘정확 복구’(기본값 강제 없음) -----
+    # ----- 후보 메타 인덱스 (정확 복구용) -----
     catalog_index: Dict[str, Dict[str, Any]] = {}
     for it in (state.get("pois", []) + state.get("stays", [])):
         k = _norm_title(it.get("title"))
@@ -523,17 +509,14 @@ def node_build_itinerary(state: TripState):
     def _clean_segments_strict(segs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         cleaned = []
         for s in segs:
-            # images 정규화
             imgs = s.get("images") or []
             if isinstance(imgs, str):
                 imgs = [imgs]
             s["images"] = imgs[:3]
 
-            # coords 자리 보장
             if not isinstance(s.get("coords"), dict):
                 s["coords"] = {"mapx": None, "mapy": None}
 
-            # 카탈로그 메타로 ‘정확 복구’
             k = _norm_title(s.get("title"))
             meta = catalog_index.get(k, {})
             if not s.get("provider"):
@@ -546,20 +529,21 @@ def node_build_itinerary(state: TripState):
             if not s.get("images"):
                 s["images"] = (meta.get("images") or [])[:3]
 
-            # 필수 누락 시 드랍(기본값 강제/추측 없음)
             if _valid(s):
                 cleaned.append(s)
         return cleaned
 
-    # 일자별 세그먼트 정리
     for day in plan.get("days", []):
         segs = day.get("segments", [])
         day["segments"] = _clean_segments_strict(segs)
 
-    # 숙박 정리
     plan["stays"] = _clean_segments_strict(plan.get("stays", []))
 
-    # ★ 완료 상태로 갱신
+    # ★ themes/theme 주입: tags 그대로
+    themes_from_tags = list(dict.fromkeys(state.get("tags", [])))
+    plan["themes"] = themes_from_tags
+    plan["theme"]  = themes_from_tags[0] if themes_from_tags else None
+
     _set_status(state, "DONE", "완료되었습니다.")
     return {**state, "plan": plan}
 
@@ -582,13 +566,12 @@ app = graph.compile()
 # 실행 예시 (멀티턴)
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
-    # 데모용 기본 origin: 홍대 놀이터 근처
     DEFAULT_ORIGIN = {"mapX": 126.922997, "mapY": 37.552236}  # (lng, lat)
 
     # 1턴
     state: TripState = {
         "userQuery": "홍대에서 2일 코스로 맛집+볼거리 위주로 추천해줘",
-        "origin": DEFAULT_ORIGIN,   # 프론트에서 좌표를 줄 수 있다면 이 값을 사용
+        "origin": DEFAULT_ORIGIN,
         "days": 2,
         "mode": "walk",
         "tags": []
@@ -598,8 +581,9 @@ if __name__ == "__main__":
     print(json.dumps(out1.get("plan", {}), ensure_ascii=False, indent=2))
     print("\n상태:", out1.get("status"))
 
-    # 2턴 (후속 지시)
+    # 2턴
     out1["userQuery"] = "비 올 것 같으니 실내 위주로 1일로 줄여줘. 홍대입구역 근처가 좋아."
+    out1["tags"] = ["힐링"]  # 예: 사용자가 힐링 언급
     out2 = app.invoke(out1)
     print("\n=== 2턴 결과(수정 반영) ===")
     print(json.dumps(out2.get("plan", {}), ensure_ascii=False, indent=2))
